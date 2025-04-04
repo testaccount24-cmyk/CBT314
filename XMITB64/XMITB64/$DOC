@@ -1,0 +1,12 @@
+XMITB64 is an assembler program used by XMITIP to encode binary data
+into base64 (aka MIME format) so that it can be sent as an attachment
+to an SMTP mail.
+
+The program was developed by Mark Feldman and shared with the XMITIP
+author.
+
+This pds contains the following should you want to change and/or
+assemble the code:
+
+JCL - JCL to assemble and link the program
+XMITB64 - the source

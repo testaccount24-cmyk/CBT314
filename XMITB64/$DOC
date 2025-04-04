@@ -1,0 +1,15 @@
+This file contains the assembler program XMITB64, graciously provided by
+Mark Feldman for use with the XMITIP application (where this package is
+also included).  This is a separate package for those that just want
+this code.
+
+The members are:
+
+   $doc     what you are reading
+   asm      assembler source with jcl to assmble/link *
+   load     load library *
+   receive  rexx exec to reload the members asm and load back into
+            pds libraries.
+   * = in tso transmit (idtf) format
+
+This code is provided as is with no warranty or guarantee.
