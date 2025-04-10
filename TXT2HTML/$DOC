@@ -1,0 +1,37 @@
+This dataset contains the Text-to-HTML conversion application TXT2HTML.
+
+The members of this dataset are:
+
+$DOC     what you are reading
+CHANGES  Change history
+EXEC     TSO transmit unload of the REXX Library
+RECEIVE  REXX Exec to RECEIVE the EXEC member
+TXT2HTML Brief Users Guide
+
+Installation steps:
+
+1. unzip the distribution file
+2. binary upload the txt2html.xmit to a sequential dataset with
+   RECFM=FB LRECL=80
+3. issue TSO RECEIVE inds(upload.dsn)
+4. read this member
+5. execute the RECEIVE member (see below)
+6. copy the REXX exec's into a library in your SYSPROC or SYSEXEC
+   allocation
+
+To execute the RECEIVE member issue
+   "TSO EXEC 'hlq.pds-dsname(RECEIVE)' EXEC"
+
+The ISPF interface is activated if the exec is called with no parameters.
+
+This exec may NOT be compiled using the IBM REXX Compiler.
+
+This package is distributed under the GPLV3 License.
+
+Comments, suggestions, and complaints should be directed to the author
+at:
+
+  Lionel B. Dyck
+  Kaiser Permanente Information Technology
+  (925) 926-5332
+  Internet: lionel.b.dyck@kp.org

@@ -1,0 +1,505 @@
+* PROGRAM NAME: ENCODE64
+* DATE WRITTEN: October 2000
+* AUTHOR:       Mark Feldman    Empire Medicare Services
+* FACILITY:     XMITIP Support
+* ENVIRONMENT:  Assembled under OS for MVS
+*               N.B.: this program file contains lower-case characters!
+*                     Characters at address TRANTBL must remain l/c!
+* SUMMARY:
+* ENCODE64 encodes a file into base64 format.  In the base 64
+* scheme, successive 24-bit groups (3 bytes) of data are
+* converted into 4 6-bit values, which are mapped to the base
+* 64 alphabet.  The base64 alphabet consists of these characters:
+*    0 - 25: upper case alphabet
+*   26 - 51: lower case alphabet
+*   52 - 61: digits 0 - 9
+*        62: +
+*        63: /
+*
+* Input bytes are encoded from left to right (in the IBM mainframe
+* view of a byte), or from high-order to low-order bits, as follows:
+* Input byte 1, bits 2-7   ==> Output character 1 (in Base64)
+* Input byte 1, bits 0-1 + ==> Output character 2
+*       byte 2, bits 4-7 +
+* Input byte 2, bits 0-3 + ==> Output character 3
+*       byte 3, bits 6-7 +
+* Input byte 4, bits 0-5   ==> Output character 4
+*
+* Note that the size of the file expands about 33% during encoding,
+* since each set of three characters are converted to four bytes.
+*
+* According to the base64 standard, special processing is required
+* at the end of file if the number of bytes in the file does not
+* end evenly in a 3-character group.  In this case, one or two
+* pad characters ("=") are added to the last record and the rest
+* of the record is left blank.  Following the standard, the
+* encoded output file contains fixed length, 76 character records.
+*
+* This program can process a fixed (F), variable (V) and undefined (U)
+* files of any record length (spanned records are not allowed).
+*
+* JCL for ENCODE64: The input DD is named ENCODIN;
+* the output DD is ENCODOUT.  The output DCB information may be
+* left blank, i.e., the RECFM and LRECL are supplied by this program.
+* By default, the output LRECL=76 and the BLKSIZE defaults to an
+* optimal size (this may NOT work in a non-SMS environment).
+* DD SYSOUT is used for informative messages and end-of-job
+* totals.  The program will abend with a condition code of 100 if
+* it encounters any error (the only two checked are errors opening
+* the input or output files).
+*
+* //JOBLIB  DD  DSN=load-library-containing-ENCODE64,DISP=SHR
+* //S010     EXEC PGM=ENCODE64
+* //ENCODIN  DD DSN=your-input-file,DISP=SHR
+* //ENCODOUT DD DSN=encoded-output-file,
+* //            UNIT=unit,SPACE=(TRK,(3,2),RLSE),
+* //            DISP=(NEW,CATLG,DELETE)
+* //SYSOUT      DD SYSOUT=*
+* //SYSUDUMP    DD SYSOUT=Z
+*
+* Base64 encoding is an accepted content-transfer-encoding value
+* in the Internet MIME standard.  Using base64 encoding avoids
+* communication path problems that may arise if a file being
+* appended to an Email contains non-printable characters.  This
+* program can be used with the XMITIP Rexx program to append
+* binary files to an Email originating on the mainframe.  ENCODE64
+* is much faster than the encoding algorithm built into XMITIP.
+*
+* For more information on base64, refer to the MIME standards
+* at http://www.oac.uci.edu/indiv/ehood/MIME/2045/rfc2045.html.
+*
+**********************************************************************
+ENCODE64 CSECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+         USING *,R11                  R11
+         LR    R11,R15                ADDRESSABILITY ON ...
+         STM   R14,R12,12(R13)        SAVE CALLER'S REGISTERS
+         LR    R14,R13                R14=CALLER'S SAVE AREA
+         LA    R13,SAVEAREA           OUR SAVE AREA
+         ST    R14,4(,R13)            STORE CALLERS SAVE AREA
+         ST    R13,8(,R14)            AND OURS
+*
+* SUBROUTINE ENINIT OPENS FILES AND DOES OTHER HOUSKEEPING
+         BAL   R15,ENINIT             INITIALIZE
+         LTR   R1,R1                  TEST RETURN CODE
+         BZ    M0010                  CONTINUE
+         ABEND 100,DUMP               ABEND - OPEN FAILURES
+*
+* ENCODING LOGIC:
+* -  GET NEXT 24-BIT GROUP FROM INPUT RECORD (ENREAD).
+*    BITS 0-23 IN R2 CONTAIN THE GROUP.  R3 CONTAINS THE NUMBER
+*    OF BYTES READ (0, 1, 2, OR 3).
+* -  IF R3 = 0, THEN DONE.
+* -  INCREMENT R3 TO GET THE NUMBER OF ITERATIONS NEEDED TO PROCESS
+*    EACH SET OF 6 BITS IN R2.
+* -  IN EACH ITERATION, SHIFT R2 6 BITS TO THE LEFT TO ISOLATE THE
+*    NEXT 6 HIGH-ORDER BITS IN THE 4TH BYTE OF THE REGISTER.  MOVE R2
+*    TO R5 FOR CALCULATIONS, ZERO ALL BITS BUT THOSE WE WANT (24-29)
+*    AND THEN RIGHT SHIFT TO BITS 0-6. R5 NOW HAS NUMBER BETWEEN 0 AND
+*    63 READY FOR TRANSLATION TO THE BASE64 ALPHABET.
+* -  ADD THE ENCODED BYTE TO THE OUTPUT RECORD, WRITING IF FULL.
+* -  AT THE END OF THE LOOP, CHECK FOR EOF AND PAD THE FINAL OUTPUT
+*    RECORD IF NECESSARY.  IF R3 WAS 1, ADD TWO "=" CHARACTERS.  IF
+*    R3 WAS 2, ADD ONE "=".
+*    N.B.: IN THIS SECTION, I NUMBER BITS FROM RIGHT TO LEFT.
+* REGISTER ASSIGNMENTS IN THIS SECTION
+* R2:  24-BIT GROUP FROM FILE
+* R3:  NUMBER OF BYTES IN 24-BIT GROUP (0-3)
+* R4:  LOOP COUNTER (R3 + 1)
+* R5:  ITERATION RESULT (6-BIT NUMBER BETWEEN 0 AND 63)
+* R9:  OUTPUT RECORD POINTER (MAINTAINED ACROSS READS)
+* R10: NUMBER OF BYTES IN THE OUTPUT RECORD  (ALSO MAINTAINED)
+*
+M0010    EQU   *
+         LA    R9,OUTREC              POINT TO OUTPUT RECORD
+         XR    R10,R10                COUNT OF BYTES IN OUTREC
+*
+*  MAIN ENCODING LOOP: E0000 THROUGH E0060
+E0000    EQU   *
+         BAL   R15,ENREAD             GET NEXT 24-BIT GROUP
+         LTR   R3,R3                  24-BIT GROUP EMPTY?
+         BZ    E0030                  YES - GO TO EOF PROCESSING
+         LA    R4,1(,R3)              ITERATION COUNTER
+*
+E0010    EQU   *                      LOOP HERE
+         SLL   R2,6                   SHIFT R2 LEFT 6-BITS
+         LR    R5,R2                  MOVE TO WORK AREA
+         N     R5,=X'3F000000'        ZERO ALL BITS BUT 24-29
+         SRL   R5,24                  SHIFT TO BITS 0-5
+*  RIGHT-JUSTIFIED 6 BITS ARE IN R5 (BITS 6-31 ARE ZERO).
+*  TRANSLATE TO BASE64 ALPHABET USING TABLE 'TRANTBL'
+         LA    R1,TRANTBL             LOAD ADDRESS OF TRANSLATION TABLE
+         AR    R1,R5                  ADD 6-BIT NUMBER AS OFFSET
+         MVC   0(1,R9),0(R1)          ADD ENCODED BYTE
+         L     R1,BYTSOUT             LOAD COUNT OF BYTES WRITTEN
+         LA    R1,1(,R1)              INCREMENT COUNT
+         ST    R1,BYTSOUT             STORE COUNT
+         LA    R9,1(,R9)              INCREMENT RECORD POINTER
+         LA    R10,1(,R10)            INCREMENT RECORD LENGTH
+         CH    R10,=H'76'             DID WE FILL THE RECORD (LRECL=76)
+         BNE   E0020                  NO
+         BAL   R15,ENWRITE            WRITE THIS RECORD
+         LA    R9,OUTREC              POINT TO START OF OUTPUT RECORD
+         XR    R10,R10                INITIALIZE THE RECORD LENGTH
+E0020    EQU   *
+         BCT   R4,E0010               LOOP BACK TO E0010
+         TM    STATWORD,EOFFLG        AT END OF FILE?
+         BZ    E0000                  NO, KEEP ON ENCODING
+*
+*  WRITE OUT THE LAST OUTPUT RECORD, IF ANYTHING IN IT
+E0030    EQU   *
+         LTR   R10,R10                ANY LENGTH?
+         BZ    E0060                  ENDED ON FULL OUTPUT RECORD
+*  PAD LAST 24-BIT GROUP BASED ON THE NUMBER OF BYTES RETURNED IN R3
+         CH    R3,=H'1'               ONE BYTE IN FINAL GROUP?
+         BNE   E0040                  NO
+         MVC   0(2,R9),=C'=='         PAD WITH TWO BYTES
+         B     E0050
+E0040    EQU   *
+         CH    R3,=H'2'               TWO BYTES IN FINAL GROUP?
+         BNE   E0050                  NO - SKIP PADDING
+         MVI   0(R9),C'='             PAD WITH ONE BYTE
+E0050    EQU   *
+         BAL   R15,ENWRITE            WRITE THE LAST RECORD
+E0060    EQU   *
+*
+*  END OF ENCODING LOGIC
+*
+         BAL   R15,ENCLOS             END OF PROGRAM PROCESSING
+         XR    R15,R15                GOOD STATUS
+M0020    EQU   *
+         L     R13,4(,R13)            LOAD CALLER'S SAVEAREA ADDRESS
+         ST    R15,16(,R13)           STORE RETURN CODE
+         LM    R14,R12,12(R13)        RESTORE CALLERS REGS
+         BR    R14                    RETURN TO CALLER.
+*
+*
+******************************************************************
+*  SUBROUTINE: ENINIT
+*  THIS ROUTINES OPENS FILES.  SAVES THE FILES RECFM AND LRECL.
+*  WRITES INTRO MESSAGES.
+*
+ENINIT   EQU   *
+         ST    R15,SAVREG15           SAVE RETURN ADDRESS
+         OPEN  (SYSOUT,OUTPUT)        OPEN A DD FOR MESSAGES
+*
+*  OPEN THE OUTPUT FILE
+         USING IHADCB,R3              DCB ADDRESSABILITY
+         LA    R3,ENCODOUT            ADDRESS OF OUTPUT FILE DCB
+         OPEN  ((R3),(OUTPUT))        OPEN IT
+         TM    DCBOFLGS,DCBOFOPN      DID THE FILE OPEN?
+         BO    I2060                  YES THEN CONTINUE ON OUR WAY
+         LA    R1,OUTMSG              ERROR MESSAGE
+         BAL   R15,PUTMSG             WRITE TO SYSOUT
+         B     I2999                  BRANCH TO RETURN POINT
+         DROP  R3
+I2060    EQU   *
+*
+*  READ THE JFCB FOR DD 'ENCODIN' AND WRITE OUT THE NAME OF THE
+*  INPUT FILE.
+         LA    R2,JFCB                REG2 = ADDRESS TO PLACE JFCB
+         STCM  R2,B'1111',EXLST       STORE ADDRESS OF JFCB FOR RDJFCB
+         OI    EXLST,X'87'            POST THE EXIT TYPE
+         LA    R3,ENCODIN             REG3 = DCB ADDRESS OF ENCODIN
+         LA    R1,EXLST               REG1 = ADDRESS OF EXIT LIST
+         USING IHADCB,R3              ADDRESSABILITY TO THE DCB
+         STCM  R1,B'0111',DCBEXLSA    STORE ADDRESS OF EXIT LIST IN DCB
+*
+*   READ THE JFCB TO DETERMINE THE DSN
+         RDJFCB ((R3))                READ THE JFCB
+         USING JFCBDS,R2              ADDRESSABILITY TO THE JFCB
+         LA    R2,JFCB                REG2 = ADDRESS OF JFCB WORK AREA
+         MVC   OUTREC+31(44),JFCBDSNM STORE FILENAME IN MSG AREA
+         LA    R1,DSNMSG              MESSAGE CODE
+         BAL   R15,PUTMSG             WRITE TO SYSOUT
+         DROP  R2                     DONE WITH THE JFCB
+*
+*  OPEN THE FILE TO BE ENCODED
+         OPEN  ((R3),(INPUT))         OPEN ENCODIN
+         TM    DCBOFLGS,DCBOFOPN      DID THE FILE OPEN?
+         BO    I2010                  YES THEN CONTINUE ON OUR WAY
+         LA    R1,INMSG               ERROR MESSAGE
+         BAL   R15,PUTMSG             WRITE TO SYSOUT
+         B     I2999                  BRANCH TO RETURN POINT
+*
+*  SAVE THE LRECL AND RECFM FROM THE OPEN DCB
+I2010    EQU   *
+         XR    R4,R4                  CLEAR REGISTER 4
+         ICM   R4,B'0011',DCBLRECL    GRAB THE FILE'S LRECL
+         ST    R4,TFLRECL             SAVE LRECL
+         LA    R4,1(,R4)              SET CURRENT RECORD POSITION HIGH
+         ST    R4,RECPTR               TO FORCE FIRST READ IN 'ENREAD'
+         TM    DCBRECFM,DCBRECU       RECFM=U?
+         BO    I2020                  NO - DEFAULT TO FIXED LENGTH
+         TM    DCBRECFM,DCBRECV       IS THE "V" BIT SET?
+         BNO   I2030                  NO
+         OI    STATWORD,RECFMVB       FLAG THE FILE AS VB
+         B     I2030
+I2020    EQU   *
+         OI    STATWORD,RECFMU        FLAG THE FILE AS UNDEFINED
+I2030    EQU   *
+         XR    R1,R1                  GOOD STATUS
+*
+I2999    EQU   *
+         L     R15,SAVREG15           LOAD THE RETURN ADDRESS
+         BR    R15                    RETURN
+         DROP  R3
+*
+*
+******************************************************************
+*  SUBROUTINE: ENREAD
+*  THIS ROUTINE GETS THE NEXT 24-BIT GROUP (3 BYTES) FROM THE
+*  INPUT FILE.  THE MAJOR LOOP IN THIS ROUTINE IS CYCLED THREE
+*  TIMES TO GATHER A FULL 24-BIT GROUP.  THE ONLY TIME LESS
+*  THAN 24 BITS ARE RETURNED TO THE CALLER IS AT END OF FILE.
+*  WHEN NECESSARY, SUBSEQUENT RECORDS ARE READ FROM 'ENCODIN'.
+*
+*  REGISTER ASSIGNMENTS:
+*  R1: ADDRESS OF NEXT BYTE IN INPUT RECORD
+*  R2: 24-BIT GROUP IN BITS 0 - 23 (RETURNED TO CALLER)
+*  R3: NUMBER OF BYTES RETURNED (1-3, ALSO RETURNED TO CALLER)
+*  R4: WORK REG FOR CURRENT POSITION IN INPUT RECORD (FROM RECPTR)
+*  R5: WORK REG FOR CURRENT RECORD LENGTH (FROM TFLRECL)
+*  R6: TEMPORARY ADDRESSABILITY, ETC.
+*
+ENREAD   EQU   *
+         ST    R15,SAVREG15           SAVE RETURN ADDRESS
+         L     R1,RECADDR             ADDRESS OF RECORD BUFFER
+         L     R4,RECPTR              CURRENT OFFSET IN BUFFER
+         AR    R1,R4                  NEXT BYTE IN INPUT RECORD
+         L     R5,TFLRECL             LENGTH OF CURRENT RECORD
+         XR    R2,R2                  CLEAR THE RESULT REGISTER
+         XR    R3,R3                  CLEAR COUNT OF BYTES RETURNED
+R0010    EQU   *
+         CR    R4,R5                  STILL BYTES IN THIS RECORD?
+         BL    R0050                  YES - SO NO NEED TO READ
+*
+*  READ THE NEXT RECORD.
+R0012    EQU   *
+         GET   ENCODIN
+         TM    STATWORD,RECFMU        RECFM=U FILE?
+         BZ    R0020                  TRY OTHER FORMAT
+*  DETERMINE LENGTH OF RECFM=U RECORD
+         USING IHADCB,R6              ADDRESSABILITY TO THE DCB
+         LA    R6,ENCODIN             INPUT FILE DCB
+         ICM   R5,B'0011',DCBLRECL    LOAD LENGTH OF THIS RECORD
+         DROP  R6                     DROP ADDRESSABILITY TO DCB
+         B     R0030
+R0020    EQU   *
+*  DETERMINE LENGTH OF RECFM=V RECORD
+         TM    STATWORD,RECFMVB       VARIABLE FILE?
+         BZ    R0030                  NO, SKIP TO COMMON LOGIC.
+         ICM   R5,B'0011',0(R1)       R4=RDW OF THIS RECORD
+         S     R5,=F'4'               LESS 4 TO ACCOUNT FOR RDW LENGTH
+         LA    R1,4(,R1)              BUMP THE RECORD ADDR PAST THE RDW
+R0030    EQU   *
+*  CONTINUING FOR ALL FILE FORMATS
+         ST    R1,RECADDR             STORE BUFFER ADDRESS
+         ST    R5,TFLRECL             STORE RECORD LENGTH
+         L     R4,RECSIN              LOAD COUNT OF RECORDS READ
+         LA    R4,1(,R4)              INCREMENT COUNT
+         ST    R4,RECSIN              STORE COUNT
+         LTR   R5,R5                  COULD A RECORD HAVE LENGTH=0?
+         BZ    R0012                  IF SO, SKIP IT AND READ AGAIN.
+         XR    R4,R4                  ZERO R4 (CURR POS IN NEW REC)
+R0050    EQU   *
+*
+*  MOVE NEXT BYTE INTO POSITION IN R2.  BUT FIRST SHIFT THE
+*  REGISTER 8 BITS TO THE LEFT TO MAKE ROOM.
+         SLL   R2,8                   MAKE ROOM FOR NEW BYTE
+         IC    R2,0(R1)               INSERT BYTE
+         LA    R1,1(,R1)              INCREMENT BUFFER ADDRESS
+         LA    R3,1(,R3)              COUNT BYTES RETURNED
+         LA    R4,1(,R4)              INCREMENT POSITION IN RECORD
+         CH    R3,=H'3'               LOOP THREE TIMES
+         BL    R0010                  GO BACK
+         ST    R4,RECPTR              STORE UPDATED RECORD POINTER
+         L     R6,BYTSIN              LOAD COUNT OF BYTES READ
+         AR    R6,R3                  INCREMENT BY # BYTES RETURNED
+         ST    R6,BYTSIN              STORE COUNT
+         L     R15,SAVREG15           LOAD THE RETURN ADDRESS
+         BR    R15                    RETURN
+*
+* INPUT FILE END-OF-FILE ADDRESS.  NOTE THAT IN THIS CASE ONLY, WE
+* RETURN LESS THAN 3 BYTES IN R2 AND R3 TO THE ENCODING ALGORITHM.
+* EXTRA SHIFTING MAY BE NEEDED IF LESS THAN 3 BYTES HAVE BEEN MOVE.
+ENEOF    EQU   *
+         OI    STATWORD,EOFFLG        FLAG EOF
+         L     R6,BYTSIN              LOAD COUNT OF BYTES READ
+         AR    R6,R3                  INCREMENT BY # BYTES RETURNED
+         ST    R6,BYTSIN              STORE COUNT
+         CH    R3,=H'2'               TWO BYTES MOVED AT EOF?
+         BNE   R0100
+         SLL   R2,8                   SHIFT THEM OVER ONE BYTE
+         B     R0200
+R0100    EQU   *
+         CH    R3,=H'1'               ONE BYTE MOVED AT EOF?
+         BNE   R0200
+         SLL   R2,16                  SHIFT IT OVER TWO BYTES
+R0200    EQU   *
+         L     R15,SAVREG15           LOAD ENREAD'S RETURN ADDRESS
+         BR    R15                    RETURN
+*
+*
+********************************************************************
+*  SUBROUTINE: ENWRITE
+*  THIS ROUTINE WRITES AN OUTPUT RECORD, COUNTS THE RECORDS
+*  WRITTEN, AND THEN CLEARS THE OUTPUT BUFFER.
+*
+ENWRITE  EQU   *
+         ST    R15,SAVREG15           SAVE RETURN ADDRESS
+         PUT   ENCODOUT,OUTREC        WRITE THE RECORD
+         L     R1,RECSOUT             LOAD COUNT OF RECORDS WRITTEN
+         LA    R1,1(,R1)              INCREMENT COUNT
+         ST    R1,RECSOUT             STORE COUNT
+         MVI   OUTREC,C' '            INITIALIZE THE BUFFER
+         MVC   OUTREC+1(75),OUTREC    ... TO SPACES
+         L     R15,SAVREG15           LOAD THE RETURN ADDRESS
+         BR    R15                    RETURN
+*
+*
+********************************************************************
+*  SUBROUTINE: ENCLOS
+*  CLOSE FILES AND WRITE PROGRAM RESULTS.
+*
+ENCLOS   EQU   *
+         ST    R15,SAVREG15           SAVE RETURN ADDRESS
+         PUT   SYSOUT,OUTREC          WRITE A BLANK LINE
+         LA    R5,RECSIN              ADDRESS OF FIRST COUNT TO DISPLAY
+         LA    R6,EOFMSG1             FIRST MESSAGE NUMBER TO WRITE
+         LA    R7,5                   NUMBER OF MESSAGES TO WRITE
+*
+C0010    EQU   *
+         LR    R1,R6                  R1=MESSAGE NUMBER
+         L     R2,0(R5)               R2=BINARY VALUE TO DISPLAY
+         BAL   R15,PUTMSG             WRITE TO SYSOUT
+         LA    R5,4(,R5)              NEXT COUNT TO DISPLAY
+         LA    R6,1(,R6)              NEXT MESSAGE TO DISPLAY
+         BCT   R7,C0010               LOOP
+*  CLOSE FILES
+         CLOSE (ENCODIN,FREE)         CLOSE THE INPUT FILE
+         CLOSE (ENCODOUT,FREE)        CLOSE THE OUTPUT FILE
+         CLOSE SYSOUT                 CLOSE SYSOUT
+         L     R15,SAVREG15           LOAD THE RETURN ADDRESS
+         BR    R15                    RETURN TO MAIN ROUTINE
+*
+*
+******************************************************************
+*  SUBROUTINE: PUTMSG (ERROR OR INFORMATIONAL MESSAGES)
+*  WRITES A MESSAGE TO THE SYSOUT DD STATEMENT
+*  THE MESSAGE TEXT IS STORED AS LOCATION "MSGAREA".  EACH MESSAGE
+*  IS 32 BYTES IN LENGTH, BUT THE FIRST BYTE CONTAINS A FORMAT
+*  INDICATOR:
+*  0=NO FORMATTING
+*  1=CONVERT THE VALUE STORED IN R2 TO DECIMAL AND ADD TO END OF MSG
+*  PUTMSG USES THE MESSAGE NUMBER PASSED IN R1 TO INDEX THE MSGAREA
+*  STRINGS.  IT MOVES BYTES 2-32 OF THE MESSAGE TO THE OUTPUT AREA
+*  AND THEN PERFORMS THE OPTIONAL FORMATTING.
+*  INPUT REGS:
+*  R1:   ERROR/INFORMATION MESSAGE NUMBER
+*  R2:   BINARY FW TO BE FORMATTED
+*
+PUTMSG   EQU   *
+         ST    R15,SAVREG15+4         SAVE RETURN ADDRESS
+         LR    R0,R2
+         BCTR  R1,0                   SUBTRACT ONE FROM MSG CODE
+         SLL   R1,5                   MULTIPLY BY 32
+         LA    R2,MSGAREA(R1)         POINT TO MESSAGE INDEXED BY R1
+         MVC   OUTREC(31),1(R2)       MOVE THE MESSAGE (BYTES 2-32)
+*
+*  SEE IF THE MESSAGE WILL BE FOLLOWED BY A STRING OR NUMBER
+         CLI   0(R2),C'0'             NO FORMATTING?
+         BE    PUT030                 YES - SKIP
+*  CONVERT THE NUMBER IN R2 TO DECIMAL
+         CVD   R0,DBLWORD             CONVERT BIN-TO-DECIMAL
+         MVC   OUTREC+31(L'EDMASK),EDMASK     MOVE MASK TO PRINT LINE
+         ED    OUTREC+31(L'EDMASK),DBLWORD+3 MOVE NUMBER
+*  NOW WRITE THE MESSAGE
+PUT030   EQU   *
+         PUT   SYSOUT,OUTREC          WRITE MESSAGE TO SYSOUT
+         MVI   OUTREC,C' '            BLANK OUT .THE MESSAGE AREA
+         MVC   OUTREC+1(79),OUTREC    FOR THE NEXT TIME
+         L     R15,SAVREG15+4         RESTORE RETURN ADDRESS
+         BR    R15                    RETURN
+*
+*
+******************************************************************
+*  WORKING STORAGE
+*
+         DS    0D
+DBLWORD  DS    D                      WORKAREA FOR PACK/UNPACK
+SAVEAREA DS    18F                    PROGRAM SAVE AREA
+SAVREG15 DS    2F                     REGISTER SAVE AREA
+RECSIN   DC    F'0'                   COUNT OF RECORDS READ
+BYTSIN   DC    F'0'                   COUNT OF BYTES READ
+RECSOUT  DC    F'0'                   COUNT OF RECORDS WRITTEN
+BYTSOUT  DC    F'0'                   COUNT OF BYTES WRITTEN
+RECADDR  DS    F                      ADDRESS OF INPUT RECORD
+TFLRECL  DS    F                      ENCODIN LRECL
+RECPTR   DC    F'0'                   INPUT BUFFER POINTER
+*
+OUTREC   DC    CL80' '                OUTPUT BUFFER
+STATWORD DC    XL1'00'                PROGRAM STATUS WORD
+RECFMVB  EQU   1                      ..FILE IS RECFM=V
+RECFMU   EQU   2                      ..FILE IS RECFM=U
+EOFFLG   EQU   4                      ..EOF ON INPUT
+*
+*   BASE64 TRANSLATION TABLE
+TRANTBL  DC    CL26'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+         DC    CL26'abcdefghijklmnopqrstuvwxyz'
+         DC    CL12'0123456789+/'
+*
+*   MESSAGE AREA
+EDMASK   DC    X'402020206B2020206B202021'       EDIT MASK
+MSGAREA  EQU   *                      SYSOUT MESSAGES
+DSNMSG   EQU   1
+         DC    CL32'0BASE64 ENCODING ..............'
+OUTMSG   EQU   2
+         DC    CL32'0ERROR OPENING DDNAME ENCODOUT '
+INMSG    EQU   3
+         DC    CL32'0ERROR OPENING DDNAME ENCODIN  '
+EOFMSG1  EQU   4
+         DC    CL32'1RECORDS READ .................'
+EOFMSG2  EQU   5
+         DC    CL32'1BYTES READ ...................'
+EOFMSG3  EQU   6
+         DC    CL32'1RECORDS WRITTEN ..............'
+EOFMSG4  EQU   7
+         DC    CL32'1BYTES WRITTEN ................'
+EOFMSG5  EQU   8
+         DC    CL32'0BASE64 ENCODING COMPLETE      '
+*
+         DS    0F
+         LTORG
+*
+*  DEFINE DCBS
+         PRINT NOGEN
+ENCODIN  DCB   DDNAME=ENCODIN,DSORG=PS,MACRF=(GL),EODAD=ENEOF
+ENCODOUT DCB   DDNAME=ENCODOUT,DSORG=PS,MACRF=(PM),RECFM=FB,LRECL=76
+SYSOUT   DCB   DDNAME=SYSOUT,DSORG=PS,MACRF=(PM),RECFM=FB,LRECL=80
+*
+JFCB     DS    CL176                  AREA TO PLACE JFCB
+EXLST    DC    A(0)                   ENCODIN DCB EXIT LIST
+*
+********** SYSTEM DSECTS
+*
+JFCBDS   DSECT
+         IEFJFCBN                          JFCB SYMBOLICS
+         DCBD  DSORG=(DA,PS),DEVD=(DA)     DCB SYMBOLICS
+         END
